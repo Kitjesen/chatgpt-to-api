@@ -4,6 +4,8 @@
 
 核心思路：通过 ChatGPT 的 **Codex Responses API** (`/backend-api/codex/responses`) 端点绕过 Cloudflare Turnstile 人机验证，再用 `curl_cffi` 模拟 Chrome TLS 指纹完成请求。对外暴露标准的 `/v1/chat/completions` 接口，可直接对接任何 OpenAI 兼容客户端。
 
+**v5.0 新增**：Vision（图片输入）、JSON Mode / Structured Outputs、OpenAI 标准错误格式、完整参数支持。
+
 ## 背景与发现过程
 
 ### 问题
@@ -46,9 +48,11 @@ POST https://chatgpt.com/backend-api/codex/responses
 ┌──────────────────────────────────────┐
 │  FastAPI 代理服务器 (server.py)       │
 │  - API Key 鉴权                      │
-│  - 消息格式转换                       │
+│  - 消息格式转换 (含 Vision)           │
+│  - Tool Calling / JSON Mode          │
 │  - 流式/非流式响应                    │
 │  - 模型名映射                         │
+│  - OpenAI 标准错误格式                │
 └──────────────────────────────────────┘
     │
     │  curl_cffi (Chrome TLS 指纹)
@@ -65,12 +69,15 @@ POST https://chatgpt.com/backend-api/codex/responses
 
 1. **`curl_cffi`**：模拟 Chrome 131 的 TLS 指纹（JA3/JA4），避免 Cloudflare 的 TLS 指纹检测
 2. **消息格式转换**：OpenAI Chat Completions 的 `messages` 数组 → Codex Responses API 的 `instructions` + `input` 格式
-3. **角色映射**：
+3. **多模态支持**：
+   - `text` → `input_text` / `output_text`
+   - `image_url`（URL 或 base64）→ `input_image`
+4. **角色映射**：
    - `system` / `developer` → `instructions` 字段
-   - `user` → `input_text` 类型
+   - `user` → `input_text` / `input_image` 类型
    - `assistant` → `output_text` 类型
    - `tool` / `function` 等不支持的角色 → 折叠为 `user`
-4. **Token 自动刷新**：使用 Session Token 在 Access Token 过期前自动刷新，并持久化到 `.env`
+5. **Token 自动刷新**：使用 Session Token 在 Access Token 过期前自动刷新，并持久化到 `.env`
 
 ## 快速开始
 
@@ -141,42 +148,95 @@ python server.py
 ### 5. 测试
 
 ```bash
-# 无 API Key 保护时
+# 基本文本对话
 curl http://127.0.0.1:8100/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-5.2", "messages": [{"role": "user", "content": "Hello!"}]}'
 
-# 有 API Key 保护时
+# Vision（图片输入）
 curl http://127.0.0.1:8100/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-your-custom-key-here" \
-  -d '{"model": "gpt-5.2", "messages": [{"role": "user", "content": "Hello!"}]}'
+  -d '{
+    "model": "gpt-5.2",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "这张图里有什么？"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
+      ]
+    }]
+  }'
+
+# JSON Mode
+curl http://127.0.0.1:8100/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.2",
+    "messages": [{"role": "user", "content": "列出三种编程语言，以 JSON 数组返回"}],
+    "response_format": {"type": "json_object"}
+  }'
 ```
 
 ## API 文档
 
 ### `GET /v1/models`
 
-列出可用模型。
+列出可用模型。返回格式与 OpenAI 一致。
+
+### `GET /v1/models/{model_id}`
+
+获取单个模型信息。不存在时返回 404。
 
 ### `POST /v1/chat/completions`
 
 OpenAI 兼容的 Chat Completions 接口。
 
-**请求体：**
+**请求体参数：**
+
+| 参数 | 类型 | 说明 | 状态 |
+|------|------|------|------|
+| `model` | string | 模型名称 | 转发 |
+| `messages` | array | 消息列表，支持文本和图片内容 | 转发 |
+| `stream` | boolean | 是否流式返回 | 转发 |
+| `temperature` | number | 采样温度 | 转发 |
+| `tools` | array | 工具定义列表 | 转发 |
+| `tool_choice` | string/object | 工具选择策略 | 转发 |
+| `response_format` | object | 输出格式 (`json_object` / `json_schema`) | 转发 |
+| `reasoning_effort` | string | 推理力度 (`low`/`medium`/`high`) | 转发 |
+| `stop` | string/array | 停止序列 | 转发 |
+| `seed` | integer | 确定性采样种子 | 转发 |
+| `stream_options` | object | 流式选项 (`include_usage`) | 支持 |
+| `max_tokens` | integer | 最大 token 数 | 接受，不转发 |
+| `max_completion_tokens` | integer | 最大完成 token 数 | 接受，不转发 |
+| `top_p` | number | nucleus 采样 | 接受，不转发 |
+| `frequency_penalty` | number | 频率惩罚 | 接受，不转发 |
+| `presence_penalty` | number | 存在惩罚 | 接受，不转发 |
+| `n` | integer | 候选数量（仅支持 1） | 校验 |
+| `logprobs` | boolean | 返回 log 概率 | 接受，不支持 |
+| `parallel_tool_calls` | boolean | 并行工具调用 | 接受 |
+
+**消息格式（支持多模态）：**
 
 ```json
 {
-  "model": "gpt-5.2",
   "messages": [
     {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "你好"}
-  ],
-  "stream": false,
-  "temperature": 0.7,
-  "max_tokens": 4096
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "描述这张图片"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ..."}}
+      ]
+    }
+  ]
 }
 ```
+
+图片支持两种方式：
+- **URL**：`{"url": "https://example.com/image.jpg"}`
+- **Base64**：`{"url": "data:image/jpeg;base64,..."}`
+
+可选 `detail` 参数控制图片精度：`"auto"` / `"low"` / `"high"`
 
 **支持的模型名：**
 
@@ -192,6 +252,19 @@ OpenAI 兼容的 Chat Completions 接口。
 | `auto`             | `gpt-5.2`  |
 
 未识别的模型名默认映射到 `gpt-5.2`。
+
+**错误响应格式（与 OpenAI 一致）：**
+
+```json
+{
+  "error": {
+    "message": "Invalid API key",
+    "type": "authentication_error",
+    "param": null,
+    "code": null
+  }
+}
+```
 
 ### `GET /admin/status`
 
@@ -227,9 +300,31 @@ client = OpenAI(
     api_key="sk-your-custom-key-here",  # 如果设置了 API Key
 )
 
+# 文本对话
 response = client.chat.completions.create(
     model="gpt-5.2",
     messages=[{"role": "user", "content": "你好"}],
+)
+print(response.choices[0].message.content)
+
+# Vision（图片分析）
+response = client.chat.completions.create(
+    model="gpt-5.2",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "这是什么？"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}},
+        ],
+    }],
+)
+print(response.choices[0].message.content)
+
+# JSON Mode
+response = client.chat.completions.create(
+    model="gpt-5.2",
+    messages=[{"role": "user", "content": "列出三种水果"}],
+    response_format={"type": "json_object"},
 )
 print(response.choices[0].message.content)
 ```
@@ -313,15 +408,21 @@ Access Token 约 1 小时过期。如果配置了 Session Token，服务会在�
 
 目前确认可用的有 `gpt-5`、`gpt-5.1`、`gpt-5.2`。传入旧模型名（如 `gpt-4o`、`gpt-4`）会自动映射到 `gpt-5.2`。
 
+### Q: 支持 Vision（图片输入）吗？
+
+**支持。** v5.0 起，用户消息的 `content` 可以是 `[{type: "text", ...}, {type: "image_url", ...}]` 格式的数组。代理会自动将 `image_url` 转换为 Codex API 的 `input_image` 格式。支持 URL 和 base64 两种图片传入方式。
+
 ### Q: 支持 Tool/Function Calling 吗？
 
-**支持。** 自 v3.1 起，代理会：
+**支持。** 代理会：
 
 - 接收并转发客户端的 `tools`、`tool_choice` 到 Codex Responses API（仅转换 `type: "function"` 的工具定义）。
 - 将多轮中的 `assistant`（含 `tool_calls`）+ `tool` 消息转换为 Codex 的 `function_call` / `function_call_output` 输入。
 - 解析流式事件 `response.output_item.added`、`response.function_call_arguments.delta`/`.done` 以及 `response.completed` 中的 `output`，组装成 OpenAI 格式的 `tool_calls` 并返回（流式与非流式均支持）。
 
-因此 OpenClaw 等客户端在使用本代理时，可以让 GPT-5.2 与 Kimi 一样使用 read、write、exec 等工具。若遇工具不生效，请确认 Codex 后端返回的 event 类型与上述一致（ChatGPT 后端可能与公开 Responses API 在事件名上有细微差异）。
+### Q: 支持 JSON Mode / Structured Outputs 吗？
+
+**支持。** 传入 `response_format: {"type": "json_object"}` 启用 JSON 模式，或传入 `response_format: {"type": "json_schema", "json_schema": {...}}` 启用 Structured Outputs。
 
 ## 免责声明
 

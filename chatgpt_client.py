@@ -232,10 +232,74 @@ def _openai_tools_to_codex(tools: list) -> list:
     return codex_tools
 
 
+def _convert_content_parts(content, direction: str = "input") -> list[dict]:
+    """Convert OpenAI content (string or list of parts) to Codex Responses API content items.
+
+    direction="input"  -> input_text / input_image  (for user messages)
+    direction="output" -> output_text               (for assistant messages)
+    """
+    if isinstance(content, str):
+        text_type = "input_text" if direction == "input" else "output_text"
+        return [{"type": text_type, "text": content}] if content else []
+
+    if not isinstance(content, list):
+        return []
+
+    parts = []
+    for item in content:
+        if isinstance(item, str):
+            text_type = "input_text" if direction == "input" else "output_text"
+            parts.append({"type": text_type, "text": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        part_type = item.get("type", "")
+
+        if part_type == "text":
+            text_type = "input_text" if direction == "input" else "output_text"
+            parts.append({"type": text_type, "text": item.get("text", "")})
+
+        elif part_type == "image_url":
+            image_info = item.get("image_url", {})
+            url = image_info.get("url", "") if isinstance(image_info, dict) else str(image_info)
+            codex_item = {"type": "input_image", "image_url": url}
+            detail = image_info.get("detail") if isinstance(image_info, dict) else None
+            if detail and detail != "auto":
+                codex_item["detail"] = detail
+            parts.append(codex_item)
+
+        elif part_type == "input_audio":
+            audio_info = item.get("input_audio", {})
+            parts.append({"type": "input_audio", **audio_info})
+
+        else:
+            if "text" in item:
+                text_type = "input_text" if direction == "input" else "output_text"
+                parts.append({"type": text_type, "text": item["text"]})
+
+    return parts
+
+
+def _extract_text_from_content(content) -> str:
+    """Extract plain text from content (string or list of parts)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict):
+                texts.append(item.get("text", ""))
+        return " ".join(t for t in texts if t)
+    return ""
+
+
 def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]:
     """Convert OpenAI chat messages to Responses API format.
     Returns (instructions, input_items).
     Handles: system/developer -> instructions; user/assistant/tool -> input items.
+    Supports multimodal content (text + image_url) in user messages.
     Assistant with tool_calls + following tool messages -> function_call + function_call_output.
     """
     instructions = "You are a helpful assistant."
@@ -248,21 +312,20 @@ def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]
         content = msg.get("content") or ""
 
         if role in ("system", "developer"):
-            instructions = content
+            instructions = _extract_text_from_content(content)
             i += 1
             continue
 
         if role == "assistant":
             tool_calls = msg.get("tool_calls")
             if tool_calls and isinstance(tool_calls, list):
-                # Assistant content (if any) as message
-                if content:
+                text = _extract_text_from_content(content)
+                if text:
                     input_items.append({
                         "type": "message",
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": content}],
+                        "content": [{"type": "output_text", "text": text}],
                     })
-                # Add function_call items, then function_call_output from next N tool messages
                 for tc in tool_calls:
                     call_id = tc.get("id") or tc.get("call_id", "")
                     name = (tc.get("function") or {}).get("name", "")
@@ -287,21 +350,20 @@ def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]
                     })
                 i = j
                 continue
-            # Plain assistant message
             input_items.append({
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": content}],
+                "content": _convert_content_parts(content, "output") or [{"type": "output_text", "text": ""}],
             })
             i += 1
             continue
 
         if role == "tool":
-            # Standalone tool message (no preceding assistant tool_calls) -> fold into user
+            text = _extract_text_from_content(content)
             input_items.append({
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": content}],
+                "content": [{"type": "input_text", "text": text}],
             })
             i += 1
             continue
@@ -309,11 +371,13 @@ def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]
         if role not in SUPPORTED_ROLES:
             role = "user"
 
-        # user or other
+        codex_parts = _convert_content_parts(content, "input")
+        if not codex_parts:
+            codex_parts = [{"type": "input_text", "text": ""}]
         input_items.append({
             "type": "message",
             "role": role,
-            "content": [{"type": "input_text", "text": content}],
+            "content": codex_parts,
         })
         i += 1
 
@@ -335,6 +399,9 @@ def _build_codex_body(
     tools: Optional[list] = None,
     tool_choice = None,
     reasoning_effort: Optional[str] = None,
+    response_format = None,
+    stop = None,
+    seed: Optional[int] = None,
 ) -> dict:
     instructions, input_items = _messages_to_responses_input(messages)
     codex_tools = _openai_tools_to_codex(tools) if tools else []
@@ -353,6 +420,22 @@ def _build_codex_body(
         body["temperature"] = temperature
     if reasoning_effort is not None:
         body["reasoning"] = {"effort": reasoning_effort}
+    if response_format is not None:
+        fmt_type = response_format.get("type", "text")
+        if fmt_type == "json_object":
+            body["text"] = {"format": {"type": "json_object"}}
+        elif fmt_type == "json_schema":
+            schema_def = response_format.get("json_schema", {})
+            body["text"] = {"format": {
+                "type": "json_schema",
+                "name": schema_def.get("name", "response"),
+                "schema": schema_def.get("schema", {}),
+                "strict": schema_def.get("strict", False),
+            }}
+    if stop is not None:
+        body["stop"] = stop if isinstance(stop, list) else [stop]
+    if seed is not None:
+        body["seed"] = seed
 
     return body
 
@@ -562,6 +645,9 @@ async def stream_chat(
     tools: Optional[list] = None,
     tool_choice = None,
     reasoning_effort: Optional[str] = None,
+    response_format = None,
+    stop = None,
+    seed: Optional[int] = None,
 ) -> AsyncGenerator[dict, None]:
     try:
         access_token = await token_manager.get_access_token()
@@ -577,6 +663,7 @@ async def stream_chat(
     body = _build_codex_body(
         messages, resolved, max_tokens, temperature,
         tools, tool_choice, reasoning_effort,
+        response_format=response_format, stop=stop, seed=seed,
     )
     proxy = settings.proxy if settings.proxy else None
 
@@ -612,12 +699,18 @@ async def chat_completion(
     tools: Optional[list] = None,
     tool_choice = None,
     reasoning_effort: Optional[str] = None,
+    response_format = None,
+    stop = None,
+    seed: Optional[int] = None,
 ) -> dict:
     full_text = ""
     resolved_model = model
     usage = {}
     tool_calls: list = []
-    async for event in stream_chat(messages, model, max_tokens, temperature, tools, tool_choice, reasoning_effort):
+    async for event in stream_chat(
+        messages, model, max_tokens, temperature, tools, tool_choice,
+        reasoning_effort, response_format=response_format, stop=stop, seed=seed,
+    ):
         if event["type"] == "content":
             full_text += event["text"]
         elif event["type"] == "finish":

@@ -10,9 +10,10 @@ import time
 import logging
 from typing import Optional, Union
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, field_validator
 
 from config import settings
@@ -25,8 +26,8 @@ logging.basicConfig(
 
 app = FastAPI(
     title="ChatGPT-to-API",
-    description="将 ChatGPT Plus 网页版转为 OpenAI 兼容 API (via Codex Responses API)，支持 Tool Calling",
-    version="4.0.0",
+    description="将 ChatGPT Plus 网页版转为 OpenAI 兼容 API (via Codex Responses API)，支持 Vision / Tool Calling / JSON Mode",
+    version="5.0.0",
 )
 
 app.add_middleware(
@@ -36,6 +37,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+SYSTEM_FINGERPRINT = "fp_chatgpt_proxy"
+
+
+def _make_error_response(
+    status_code: int,
+    message: str,
+    error_type: str = "invalid_request_error",
+    param: str = None,
+    code: str = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    error_type = "invalid_request_error"
+    if exc.status_code == 401:
+        error_type = "authentication_error"
+    elif exc.status_code == 404:
+        error_type = "not_found_error"
+    elif exc.status_code == 429:
+        error_type = "rate_limit_error"
+    elif exc.status_code >= 500:
+        error_type = "server_error"
+    return _make_error_response(exc.status_code, str(exc.detail), error_type)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    first = errors[0] if errors else {}
+    loc = first.get("loc", [])
+    param = ".".join(str(l) for l in loc) if loc else None
+    msg = first.get("msg", str(exc))
+    return _make_error_response(400, msg, "invalid_request_error", param)
+
 
 AVAILABLE_MODELS = [
     {"id": "gpt-5.2", "object": "model", "owned_by": "openai", "created": int(time.time())},
@@ -49,21 +97,14 @@ AVAILABLE_MODELS = [
 
 class MessageInput(BaseModel):
     role: str
-    content: Union[str, list] = ""
+    content: Union[str, list, None] = ""
     tool_calls: Optional[list] = None
     tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
     @field_validator("content", mode="before")
     @classmethod
     def normalize_content(cls, v):
-        if isinstance(v, list):
-            parts = []
-            for item in v:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    parts.append(item.get("text", ""))
-            return " ".join(parts)
         if v is None:
             return ""
         return v
@@ -84,6 +125,13 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[dict] = None
     reasoning_effort: Optional[str] = None
     store: Optional[bool] = None
+    response_format: Optional[dict] = None
+    stop: Optional[Union[str, list]] = None
+    seed: Optional[int] = None
+    n: Optional[int] = None
+    parallel_tool_calls: Optional[bool] = None
+    logprobs: Optional[bool] = None
+    top_logprobs: Optional[int] = None
 
     model_config = {"extra": "allow"}
 
@@ -122,9 +170,11 @@ def make_chat_completion_response(
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
         "choices": [{
             "index": 0,
             "message": message,
+            "logprobs": None,
             "finish_reason": "tool_calls" if tool_calls else finish_reason,
         }],
         "usage": {
@@ -145,6 +195,7 @@ def _base_chunk(chat_id: str, model: str) -> dict:
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
+        "system_fingerprint": SYSTEM_FINGERPRINT,
     }
 
 
@@ -202,7 +253,7 @@ def make_usage_chunk(chat_id: str, model: str, usage: dict) -> str:
 async def root():
     return {
         "service": "ChatGPT-to-API",
-        "version": "4.0.0",
+        "version": "5.0.0",
         "backend": "Codex Responses API",
         "token_status": token_manager.status,
     }
@@ -214,14 +265,25 @@ async def list_models(authorization: Optional[str] = Header(None)):
     return {"object": "list", "data": AVAILABLE_MODELS}
 
 
+@app.get("/v1/models/{model_id:path}")
+async def retrieve_model(model_id: str, authorization: Optional[str] = Header(None)):
+    verify_auth(authorization)
+    for m in AVAILABLE_MODELS:
+        if m["id"] == model_id:
+            return m
+    return _make_error_response(404, f"The model '{model_id}' does not exist", "not_found_error", "model_id")
+
+
 def _request_messages_to_list(request: ChatCompletionRequest) -> list[dict]:
     out = []
     for m in request.messages:
-        msg = {"role": m.role, "content": m.content}
+        msg: dict = {"role": m.role, "content": m.content}
         if m.tool_calls is not None:
             msg["tool_calls"] = m.tool_calls
         if m.tool_call_id is not None:
             msg["tool_call_id"] = m.tool_call_id
+        if m.name is not None:
+            msg["name"] = m.name
         out.append(msg)
     return out
 
@@ -232,9 +294,19 @@ async def chat_completions(
     authorization: Optional[str] = Header(None),
 ):
     verify_auth(authorization)
+
+    if request.n is not None and request.n > 1:
+        return _make_error_response(400, "n > 1 is not supported by this proxy", "invalid_request_error", "n")
+
     messages = _request_messages_to_list(request)
     model = request.model
     max_tokens = request.resolved_max_tokens
+
+    extra_params = {
+        "response_format": request.response_format,
+        "stop": request.stop,
+        "seed": request.seed,
+    }
 
     if request.stream:
         return StreamingResponse(
@@ -242,6 +314,7 @@ async def chat_completions(
                 messages, model, max_tokens, request.temperature,
                 request.tools, request.tool_choice,
                 request.reasoning_effort, request.include_usage,
+                **extra_params,
             ),
             media_type="text/event-stream",
             headers={
@@ -256,6 +329,7 @@ async def chat_completions(
             messages, model, max_tokens, request.temperature,
             request.tools, request.tool_choice,
             request.reasoning_effort,
+            **extra_params,
         )
         return JSONResponse(make_chat_completion_response(
             result.get("model", model),
@@ -264,7 +338,7 @@ async def chat_completions(
             tool_calls=result.get("tool_calls"),
         ))
     except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        return _make_error_response(502, str(e), "server_error")
 
 
 async def _stream_response(
@@ -276,6 +350,9 @@ async def _stream_response(
     tool_choice = None,
     reasoning_effort: Optional[str] = None,
     include_usage: bool = False,
+    response_format: Optional[dict] = None,
+    stop = None,
+    seed: Optional[int] = None,
 ):
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
     has_tool_calls = False
@@ -287,6 +364,7 @@ async def _stream_response(
     async for event in stream_chat(
         messages, model, max_tokens, temperature,
         tools, tool_choice, reasoning_effort,
+        response_format=response_format, stop=stop, seed=seed,
     ):
         etype = event["type"]
 
@@ -373,7 +451,7 @@ if __name__ == "__main__":
     import uvicorn
 
     print("=" * 60)
-    print("  ChatGPT-to-API Proxy v4.0 (OpenClaw Compatible)")
+    print("  ChatGPT-to-API Proxy v5.0 (OpenAI API Compatible)")
     print(f"  http://{settings.host}:{settings.port}")
     print(f"  API: http://{settings.host}:{settings.port}/v1/chat/completions")
     print(f"  Backend: /backend-api/codex/responses")
