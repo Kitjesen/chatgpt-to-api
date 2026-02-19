@@ -313,6 +313,16 @@ Access Token 约 1 小时过期。如果配置了 Session Token，服务会在�
 
 目前确认可用的有 `gpt-5`、`gpt-5.1`、`gpt-5.2`。传入旧模型名（如 `gpt-4o`、`gpt-4`）会自动映射到 `gpt-5.2`。
 
+### Q: 支持 Tool/Function Calling 吗？
+
+**支持。** 自 v3.1 起，代理会：
+
+- 接收并转发客户端的 `tools`、`tool_choice` 到 Codex Responses API（仅转换 `type: "function"` 的工具定义）。
+- 将多轮中的 `assistant`（含 `tool_calls`）+ `tool` 消息转换为 Codex 的 `function_call` / `function_call_output` 输入。
+- 解析流式事件 `response.output_item.added`、`response.function_call_arguments.delta`/`.done` 以及 `response.completed` 中的 `output`，组装成 OpenAI 格式的 `tool_calls` 并返回（流式与非流式均支持）。
+
+因此 OpenClaw 等客户端在使用本代理时，可以让 GPT-5.2 与 Kimi 一样使用 read、write、exec 等工具。若遇工具不生效，请确认 Codex 后端返回的 event 类型与上述一致（ChatGPT 后端可能与公开 Responses API 在事件名上有细微差异）。
+
 ## 免责声明
 
 本项目仅供学习和研究用途。使用者需拥有有效的 ChatGPT Plus 订阅。请遵守 OpenAI 的使用条款。

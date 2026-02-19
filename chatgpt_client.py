@@ -212,70 +212,162 @@ token_manager = TokenManager()
 
 SUPPORTED_ROLES = {"user", "assistant", "system", "developer"}
 
+
+def _openai_tools_to_codex(tools: list) -> list:
+    """Convert OpenAI Chat Completions tools to Responses API format."""
+    if not tools:
+        return []
+    codex_tools = []
+    for t in tools:
+        if t.get("type") != "function":
+            continue
+        fn = t.get("function") or {}
+        codex_tools.append({
+            "type": "function",
+            "name": fn.get("name", ""),
+            "description": fn.get("description") or "",
+            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            "strict": fn.get("strict", False),
+        })
+    return codex_tools
+
+
 def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]:
     """Convert OpenAI chat messages to Responses API format.
     Returns (instructions, input_items).
-    system/developer -> instructions; user/assistant -> input items.
-    Unsupported roles (tool, function) are folded into user messages.
+    Handles: system/developer -> instructions; user/assistant/tool -> input items.
+    Assistant with tool_calls + following tool messages -> function_call + function_call_output.
     """
     instructions = "You are a helpful assistant."
     input_items = []
+    i = 0
 
-    for msg in messages:
+    while i < len(messages):
+        msg = messages[i]
         role = msg["role"]
         content = msg.get("content") or ""
 
         if role in ("system", "developer"):
             instructions = content
+            i += 1
+            continue
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls")
+            if tool_calls and isinstance(tool_calls, list):
+                # Assistant content (if any) as message
+                if content:
+                    input_items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": content}],
+                    })
+                # Add function_call items, then function_call_output from next N tool messages
+                for tc in tool_calls:
+                    call_id = tc.get("id") or tc.get("call_id", "")
+                    name = (tc.get("function") or {}).get("name", "")
+                    args = (tc.get("function") or {}).get("arguments", "{}")
+                    input_items.append({
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": args if isinstance(args, str) else json.dumps(args),
+                    })
+                j = i + 1
+                for tc in tool_calls:
+                    call_id = tc.get("id") or tc.get("call_id", "")
+                    out_content = ""
+                    if j < len(messages) and messages[j].get("role") == "tool":
+                        out_content = messages[j].get("content") or ""
+                        j += 1
+                    input_items.append({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": out_content if isinstance(out_content, str) else json.dumps(out_content),
+                    })
+                i = j
+                continue
+            # Plain assistant message
+            input_items.append({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content}],
+            })
+            i += 1
+            continue
+
+        if role == "tool":
+            # Standalone tool message (no preceding assistant tool_calls) -> fold into user
+            input_items.append({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": content}],
+            })
+            i += 1
             continue
 
         if role not in SUPPORTED_ROLES:
             role = "user"
 
-        if role == "assistant":
-            content_type = "output_text"
-        else:
-            content_type = "input_text"
-
+        # user or other
         input_items.append({
             "type": "message",
             "role": role,
-            "content": [{"type": content_type, "text": content}],
+            "content": [{"type": "input_text", "text": content}],
         })
+        i += 1
 
     return instructions, input_items
+
+
+def _normalize_tool_choice(tool_choice, has_tools: bool):
+    """Normalize tool_choice for Codex: str passthrough, dict passthrough, default auto/none."""
+    if tool_choice is not None:
+        return tool_choice
+    return "auto" if has_tools else "none"
 
 
 def _build_codex_body(
     messages: list[dict],
     model: str = "gpt-5",
-    max_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None,  # accepted but not forwarded; Codex rejects max_output_tokens
     temperature: Optional[float] = None,
+    tools: Optional[list] = None,
+    tool_choice = None,
+    reasoning_effort: Optional[str] = None,
 ) -> dict:
     instructions, input_items = _messages_to_responses_input(messages)
+    codex_tools = _openai_tools_to_codex(tools) if tools else []
 
     body = {
         "model": model,
         "instructions": instructions,
         "input": input_items,
-        "tools": [],
-        "tool_choice": "auto",
+        "tools": codex_tools,
+        "tool_choice": _normalize_tool_choice(tool_choice, bool(codex_tools)),
         "store": False,
         "stream": True,
     }
 
-    if max_tokens is not None:
-        body["max_output_tokens"] = max_tokens
     if temperature is not None:
         body["temperature"] = temperature
+    if reasoning_effort is not None:
+        body["reasoning"] = {"effort": reasoning_effort}
 
     return body
 
 
 # ──────────── Streaming via curl_cffi (sync, run in thread) ────────────
 
+def _make_tool_call_id() -> str:
+    """Generate a tool_call ID in the format OpenClaw expects (call_xxxx)."""
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
 def _stream_codex_sync(url: str, headers: dict, body: dict, proxy: Optional[str]):
-    """Synchronous streaming using curl_cffi (preserves Chrome TLS fingerprint)."""
+    """Synchronous streaming using curl_cffi (preserves Chrome TLS fingerprint).
+    Yields incremental events: content, tool_call_start, tool_call_delta, finish, error.
+    """
     with CurlSession(impersonate=IMPERSONATE, proxy=proxy) as session:
         resp = session.post(url, headers=headers, json=body, stream=True, timeout=120)
 
@@ -305,6 +397,23 @@ def _stream_codex_sync(url: str, headers: dict, body: dict, proxy: Optional[str]
         buffer = ""
         collected_text = ""
         resolved_model = ""
+        tool_calls_acc: list[dict] = []
+        tool_call_index = -1
+
+        def _emit_tool_calls(output: list) -> list:
+            out = []
+            for item in output:
+                if item.get("type") == "function_call":
+                    tc_id = item.get("call_id") or item.get("id") or _make_tool_call_id()
+                    out.append({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}") if isinstance(item.get("arguments"), str) else json.dumps(item.get("arguments", {})),
+                        },
+                    })
+            return out
 
         for chunk in resp.iter_content():
             if isinstance(chunk, bytes):
@@ -323,7 +432,7 @@ def _stream_codex_sync(url: str, headers: dict, body: dict, proxy: Optional[str]
 
                 data_str = line[6:]
                 if data_str == "[DONE]":
-                    yield {"type": "finish", "text": collected_text, "model": resolved_model}
+                    yield {"type": "finish", "text": collected_text, "model": resolved_model, "tool_calls": tool_calls_acc}
                     return
 
                 try:
@@ -336,6 +445,44 @@ def _stream_codex_sync(url: str, headers: dict, body: dict, proxy: Optional[str]
                 if etype == "response.created":
                     resp_obj = evt.get("response", {})
                     resolved_model = resp_obj.get("model", "")
+                    tool_calls_acc = []
+                    tool_call_index = -1
+
+                elif etype == "response.output_item.added":
+                    item = evt.get("item", {})
+                    if item.get("type") == "function_call":
+                        tool_call_index += 1
+                        tc_id = item.get("id") or item.get("call_id") or _make_tool_call_id()
+                        tc_name = item.get("name", "")
+                        tc_entry = {
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": tc_name, "arguments": ""},
+                        }
+                        tool_calls_acc.append(tc_entry)
+                        yield {
+                            "type": "tool_call_start",
+                            "index": tool_call_index,
+                            "id": tc_id,
+                            "name": tc_name,
+                        }
+
+                elif etype == "response.function_call_arguments.delta":
+                    delta_str = evt.get("delta", "")
+                    if delta_str and tool_calls_acc:
+                        tool_calls_acc[-1]["function"]["arguments"] += delta_str
+                        yield {
+                            "type": "tool_call_delta",
+                            "index": tool_call_index,
+                            "arguments_delta": delta_str,
+                        }
+
+                elif etype == "response.function_call_arguments.done":
+                    item = evt.get("item", {})
+                    if item and tool_calls_acc:
+                        final_args = item.get("arguments")
+                        if final_args is not None:
+                            tool_calls_acc[-1]["function"]["arguments"] = final_args
 
                 elif etype == "response.output_text.delta":
                     delta = evt.get("delta", "")
@@ -347,18 +494,27 @@ def _stream_codex_sync(url: str, headers: dict, body: dict, proxy: Optional[str]
                     resp_obj = evt.get("response", {})
                     resolved_model = resp_obj.get("model", resolved_model)
                     usage = resp_obj.get("usage", {})
-                    # Extract final text from completed response
                     output = resp_obj.get("output", [])
                     for item in output:
                         if item.get("type") == "message":
                             for c in item.get("content", []):
                                 if c.get("type") == "output_text" and c.get("text"):
                                     collected_text = c["text"]
+                    fc_items = [x for x in output if x.get("type") == "function_call"]
+                    if fc_items and not tool_calls_acc:
+                        tool_calls_acc = _emit_tool_calls(fc_items)
+                        for idx, tc in enumerate(tool_calls_acc):
+                            yield {"type": "tool_call_start", "index": idx, "id": tc["id"], "name": tc["function"]["name"]}
+                            if tc["function"]["arguments"]:
+                                yield {"type": "tool_call_delta", "index": idx, "arguments_delta": tc["function"]["arguments"]}
+                    if tool_calls_acc:
+                        logger.info(f"[codex] tool_calls returned: {[tc['function']['name'] for tc in tool_calls_acc]}")
                     yield {
                         "type": "finish",
                         "text": collected_text,
                         "model": resolved_model,
                         "usage": usage,
+                        "tool_calls": tool_calls_acc,
                     }
                     return
 
@@ -367,8 +523,8 @@ def _stream_codex_sync(url: str, headers: dict, body: dict, proxy: Optional[str]
                     yield {"type": "error", "message": error_msg}
                     return
 
-        if collected_text:
-            yield {"type": "finish", "text": collected_text, "model": resolved_model}
+        if collected_text or tool_calls_acc:
+            yield {"type": "finish", "text": collected_text, "model": resolved_model, "tool_calls": tool_calls_acc}
 
 
 # ──────────── Public API ────────────
@@ -403,6 +559,9 @@ async def stream_chat(
     model: str = "gpt-5",
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
+    tools: Optional[list] = None,
+    tool_choice = None,
+    reasoning_effort: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
     try:
         access_token = await token_manager.get_access_token()
@@ -415,16 +574,20 @@ async def stream_chat(
     headers["authorization"] = f"Bearer {access_token}"
     headers["oai-device-id"] = DEVICE_ID
 
-    body = _build_codex_body(messages, resolved, max_tokens, temperature)
+    body = _build_codex_body(
+        messages, resolved, max_tokens, temperature,
+        tools, tool_choice, reasoning_effort,
+    )
     proxy = settings.proxy if settings.proxy else None
 
     if not HAS_CURL_CFFI:
         yield {"type": "error", "message": "curl_cffi 未安装，无法请求 Codex API"}
         return
 
-    logger.info(f"[codex] model={resolved} proxy={proxy}")
+    tool_names = [t.get("function", {}).get("name", "?") for t in (tools or []) if t.get("type") == "function"]
+    logger.info(f"[codex] model={resolved} proxy={proxy} tools={tool_names or 'none'} reasoning={reasoning_effort}")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     gen = _stream_codex_sync(CODEX_URL, headers, body, proxy)
 
     try:
@@ -437,6 +600,8 @@ async def stream_chat(
                 return
     except StopIteration:
         pass
+    finally:
+        gen.close()
 
 
 async def chat_completion(
@@ -444,17 +609,22 @@ async def chat_completion(
     model: str = "gpt-5",
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
+    tools: Optional[list] = None,
+    tool_choice = None,
+    reasoning_effort: Optional[str] = None,
 ) -> dict:
     full_text = ""
     resolved_model = model
     usage = {}
-    async for event in stream_chat(messages, model, max_tokens, temperature):
+    tool_calls: list = []
+    async for event in stream_chat(messages, model, max_tokens, temperature, tools, tool_choice, reasoning_effort):
         if event["type"] == "content":
             full_text += event["text"]
         elif event["type"] == "finish":
             full_text = event.get("text", full_text)
             resolved_model = event.get("model", resolved_model)
             usage = event.get("usage", {})
+            tool_calls = event.get("tool_calls") or []
         elif event["type"] == "error":
             raise RuntimeError(event["message"])
-    return {"text": full_text, "model": resolved_model, "usage": usage}
+    return {"text": full_text, "model": resolved_model, "usage": usage, "tool_calls": tool_calls}
